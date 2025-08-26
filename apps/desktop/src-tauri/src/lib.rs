@@ -6,6 +6,7 @@ mod store;
 use ext::*;
 use store::*;
 
+use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_windows::{HyprWindow, WindowsPluginExt};
 
 use tracing_subscriber::{
@@ -149,6 +150,7 @@ pub async fn main() {
             let handler = specta_builder.invoke_handler();
             move |invoke| handler(invoke)
         })
+        .on_window_event(tauri_plugin_windows::on_window_event)
         .setup(move |app| {
             let app = app.handle().clone();
 
@@ -168,10 +170,17 @@ pub async fn main() {
                         return;
                     };
 
-                    let dests = deeplink::parse(url);
-                    for dest in dests {
-                        if app_clone.window_show(dest.window.clone()).is_ok() {
-                            let _ = app_clone.window_navigate(dest.window, &dest.url);
+                    let actions = deeplink::parse(url);
+                    for action in actions {
+                        match action {
+                            deeplink::DeeplinkAction::OpenInternal(window, url) => {
+                                if app_clone.window_show(window.clone()).is_ok() {
+                                    let _ = app_clone.window_navigate(window, &url);
+                                }
+                            }
+                            deeplink::DeeplinkAction::OpenExternal(url) => {
+                                let _ = app_clone.opener().open_url(url.as_str(), None::<String>);
+                            }
                         }
                     }
                 });

@@ -5,12 +5,13 @@ use tauri_plugin_shell::ShellExt;
 use tauri_plugin_store2::StorePluginExt;
 
 use hypr_download_interface::DownloadProgress;
-use hypr_file::download_file_parallel;
+use hypr_file::download_file_parallel_cancellable;
 use hypr_whisper_local_model::WhisperModel;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     model::SupportedSttModel,
-    server::{external, internal, ServerType},
+    server::{external, internal, ServerHealth, ServerType},
     Connection,
 };
 
@@ -31,7 +32,7 @@ pub trait LocalSttPluginExt<R: Runtime> {
     ) -> impl Future<Output = Result<bool, crate::Error>>;
     fn get_servers(
         &self,
-    ) -> impl Future<Output = Result<HashMap<ServerType, Option<String>>, crate::Error>>;
+    ) -> impl Future<Output = Result<HashMap<ServerType, ServerHealth>, crate::Error>>;
 
     fn get_current_model(&self) -> Result<SupportedSttModel, crate::Error>;
     fn set_current_model(
@@ -68,18 +69,18 @@ impl<R: Runtime, T: Manager<R>> LocalSttPluginExt<R> for T {
     async fn get_connection(&self) -> Result<Connection, crate::Error> {
         let model = self.get_current_model()?;
 
-        let am_key = {
-            let state = self.state::<crate::SharedState>();
-            let key = state.lock().await.am_api_key.clone();
-            key.clone().ok_or(crate::Error::AmApiKeyNotSet)?
-        };
-
         match model {
             SupportedSttModel::Am(_) => {
                 let existing_api_base = {
                     let state = self.state::<crate::SharedState>();
                     let guard = state.lock().await;
                     guard.external_server.as_ref().map(|s| s.base_url.clone())
+                };
+
+                let am_key = {
+                    let state = self.state::<crate::SharedState>();
+                    let key = state.lock().await.am_api_key.clone();
+                    key.clone().ok_or(crate::Error::AmApiKeyNotSet)?
                 };
 
                 let conn = match existing_api_base {
@@ -219,8 +220,13 @@ impl<R: Runtime, T: Manager<R>> LocalSttPluginExt<R> for T {
 
                 let am_key = {
                     let state = self.state::<crate::SharedState>();
+
                     let key = state.lock().await.am_api_key.clone();
-                    key.clone().ok_or(crate::Error::AmApiKeyNotSet)?
+                    if key.clone().is_none() || key.clone().unwrap().is_empty() {
+                        return Err(crate::Error::AmApiKeyNotSet);
+                    }
+
+                    key.clone().unwrap()
                 };
 
                 let cmd: tauri_plugin_shell::process::Command = {
@@ -244,12 +250,7 @@ impl<R: Runtime, T: Manager<R>> LocalSttPluginExt<R> for T {
 
                     #[cfg(not(debug_assertions))]
                     self.shell()
-                        .command(
-                            tauri::utils::platform::current_exe()?
-                                .parent()
-                                .unwrap()
-                                .join("stt"),
-                        )
+                        .sidecar("stt")?
                         .current_dir(dirs::home_dir().unwrap())
                         .args(["serve", "-v"])
                 };
@@ -278,24 +279,20 @@ impl<R: Runtime, T: Manager<R>> LocalSttPluginExt<R> for T {
         let mut stopped = false;
         match server_type {
             Some(ServerType::External) => {
-                if let Some(server) = s.external_server.take() {
-                    let _ = server.terminate();
+                if let Some(_) = s.external_server.take() {
                     stopped = true;
                 }
             }
             Some(ServerType::Internal) => {
-                if let Some(server) = s.internal_server.take() {
-                    let _ = server.terminate();
+                if let Some(_) = s.internal_server.take() {
                     stopped = true;
                 }
             }
             None => {
-                if let Some(server) = s.external_server.take() {
-                    let _ = server.terminate();
+                if let Some(_) = s.external_server.take() {
                     stopped = true;
                 }
-                if let Some(server) = s.internal_server.take() {
-                    let _ = server.terminate();
+                if let Some(_) = s.internal_server.take() {
                     stopped = true;
                 }
             }
@@ -305,28 +302,21 @@ impl<R: Runtime, T: Manager<R>> LocalSttPluginExt<R> for T {
     }
 
     #[tracing::instrument(skip_all)]
-    async fn get_servers(&self) -> Result<HashMap<ServerType, Option<String>>, crate::Error> {
+    async fn get_servers(&self) -> Result<HashMap<ServerType, ServerHealth>, crate::Error> {
         let state = self.state::<crate::SharedState>();
         let guard = state.lock().await;
 
         let internal_url = if let Some(server) = &guard.internal_server {
-            if server.health().await {
-                Some(server.base_url.clone())
-            } else {
-                None
-            }
+            let status = server.health().await;
+            status
         } else {
-            None
+            ServerHealth::Unreachable
         };
 
         let external_url = if let Some(server) = &guard.external_server {
-            if server.health().await {
-                Some(server.base_url.clone())
-            } else {
-                None
-            }
+            server.health().await
         } else {
-            None
+            ServerHealth::Unreachable
         };
 
         Ok([
@@ -343,6 +333,20 @@ impl<R: Runtime, T: Manager<R>> LocalSttPluginExt<R> for T {
         model: SupportedSttModel,
         channel: Channel<i8>,
     ) -> Result<(), crate::Error> {
+        {
+            let existing = {
+                let state = self.state::<crate::SharedState>();
+                let mut s = state.lock().await;
+                s.download_task.remove(&model)
+            };
+
+            if let Some((existing_task, existing_token)) = existing {
+                // Cancel the download and wait for task to finish
+                existing_token.cancel();
+                let _ = existing_task.await;
+            }
+        }
+
         let create_progress_callback = |channel: Channel<i8>| {
             move |progress: DownloadProgress| match progress {
                 DownloadProgress::Started => {
@@ -362,13 +366,24 @@ impl<R: Runtime, T: Manager<R>> LocalSttPluginExt<R> for T {
             SupportedSttModel::Am(m) => {
                 let tar_path = self.models_dir().join(format!("{}.tar", m.model_dir()));
                 let final_path = self.models_dir();
+                let cancellation_token = CancellationToken::new();
+                let token_clone = cancellation_token.clone();
 
                 let task = tokio::spawn(async move {
                     let callback = create_progress_callback(channel.clone());
 
-                    if let Err(e) = download_file_parallel(m.tar_url(), &tar_path, callback).await {
-                        tracing::error!("model_download_error: {}", e);
-                        let _ = channel.send(-1);
+                    if let Err(e) = download_file_parallel_cancellable(
+                        m.tar_url(),
+                        &tar_path,
+                        callback,
+                        Some(token_clone),
+                    )
+                    .await
+                    {
+                        if !matches!(e, hypr_file::Error::Cancelled) {
+                            tracing::error!("model_download_error: {}", e);
+                            let _ = channel.send(-1);
+                        }
                         return;
                     }
 
@@ -381,25 +396,40 @@ impl<R: Runtime, T: Manager<R>> LocalSttPluginExt<R> for T {
                 {
                     let state = self.state::<crate::SharedState>();
                     let mut s = state.lock().await;
-
-                    if let Some(existing_task) = s.download_task.remove(&model) {
-                        existing_task.abort();
-                    }
-                    s.download_task.insert(model.clone(), task);
+                    s.download_task
+                        .insert(model.clone(), (task, cancellation_token));
                 }
 
                 Ok(())
             }
             SupportedSttModel::Whisper(m) => {
                 let model_path = self.models_dir().join(m.file_name());
+                let cancellation_token = CancellationToken::new();
+                let token_clone = cancellation_token.clone();
 
                 let task = tokio::spawn(async move {
                     let callback = create_progress_callback(channel.clone());
 
-                    if let Err(e) =
-                        download_file_parallel(m.model_url(), &model_path, callback).await
+                    if let Err(e) = download_file_parallel_cancellable(
+                        m.model_url(),
+                        &model_path,
+                        callback,
+                        Some(token_clone),
+                    )
+                    .await
                     {
-                        tracing::error!("model_download_error: {}", e);
+                        if !matches!(e, hypr_file::Error::Cancelled) {
+                            tracing::error!("model_download_error: {}", e);
+                            let _ = channel.send(-1);
+                        }
+                        return;
+                    }
+
+                    let checksum = hypr_file::calculate_file_checksum(&model_path).unwrap();
+
+                    if checksum != m.checksum() {
+                        tracing::error!("model_download_error: checksum mismatch");
+                        std::fs::remove_file(&model_path).unwrap();
                         let _ = channel.send(-1);
                     }
                 });
@@ -407,11 +437,8 @@ impl<R: Runtime, T: Manager<R>> LocalSttPluginExt<R> for T {
                 {
                     let state = self.state::<crate::SharedState>();
                     let mut s = state.lock().await;
-
-                    if let Some(existing_task) = s.download_task.remove(&model) {
-                        existing_task.abort();
-                    }
-                    s.download_task.insert(model.clone(), task);
+                    s.download_task
+                        .insert(model.clone(), (task, cancellation_token));
                 }
 
                 Ok(())
@@ -433,7 +460,7 @@ impl<R: Runtime, T: Manager<R>> LocalSttPluginExt<R> for T {
     fn get_current_model(&self) -> Result<SupportedSttModel, crate::Error> {
         let store = self.local_stt_store();
         let model = store.get(crate::StoreKey::DefaultModel)?;
-        Ok(model.unwrap_or(SupportedSttModel::Whisper(WhisperModel::QuantizedBase)))
+        Ok(model.unwrap_or(SupportedSttModel::Whisper(WhisperModel::QuantizedSmall)))
     }
 
     #[tracing::instrument(skip_all)]

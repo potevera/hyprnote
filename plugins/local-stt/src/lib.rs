@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use tauri::{Manager, Wry};
+use tokio_util::sync::CancellationToken;
 
 mod commands;
 mod error;
@@ -9,6 +10,7 @@ mod model;
 mod server;
 mod store;
 mod types;
+mod utils;
 
 pub use error::*;
 use events::*;
@@ -16,6 +18,7 @@ pub use ext::*;
 pub use model::*;
 pub use store::*;
 pub use types::*;
+use utils::*;
 
 pub type SharedState = std::sync::Arc<tokio::sync::Mutex<State>>;
 
@@ -24,7 +27,7 @@ pub struct State {
     pub am_api_key: Option<String>,
     pub internal_server: Option<server::internal::ServerHandle>,
     pub external_server: Option<server::external::ServerHandle>,
-    pub download_task: HashMap<SupportedSttModel, tokio::task::JoinHandle<()>>,
+    pub download_task: HashMap<SupportedSttModel, (tokio::task::JoinHandle<()>, CancellationToken)>,
 }
 
 const PLUGIN_NAME: &str = "local-stt";
@@ -44,6 +47,7 @@ fn make_specta_builder<R: tauri::Runtime>() -> tauri_specta::Builder<R> {
             commands::start_server::<Wry>,
             commands::stop_server::<Wry>,
             commands::list_supported_models,
+            commands::list_supported_languages,
         ])
         .typ::<hypr_whisper_local_model::WhisperModel>()
         .error_handling(tauri_specta::ErrorHandlingMode::Throw)

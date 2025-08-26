@@ -1,4 +1,6 @@
 use statig::prelude::*;
+
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use tauri::Manager;
@@ -313,7 +315,25 @@ impl Session {
                     let maybe_mic_chunk = aec.process_streaming(&mic_chunk_raw, &speaker_chunk);
 
                     let mic_chunk = match maybe_mic_chunk {
-                        Ok(mic_chunk) => mic_chunk,
+                        Ok(mic_chunk) => {
+                            let rms_before = (mic_chunk_raw.iter().map(|x| x * x).sum::<f32>()
+                                / mic_chunk_raw.len() as f32)
+                                .sqrt();
+                            let rms_after = (mic_chunk.iter().map(|x| x * x).sum::<f32>()
+                                / mic_chunk.len() as f32)
+                                .sqrt();
+                            let reduction_percent = if rms_before > 0.0 {
+                                ((rms_before - rms_after) / rms_before * 100.0).max(0.0)
+                            } else {
+                                0.0
+                            };
+
+                            if rms_before > 0.001 && rms_after > 0.001 && reduction_percent > 15.0 {
+                                vec![0.0; mic_chunk.len()]
+                            } else {
+                                mic_chunk
+                            }
+                        }
                         Err(e) => {
                             tracing::error!("aec_error: {:?}", e);
                             mic_chunk_raw.clone()
@@ -339,7 +359,7 @@ impl Session {
                     }
 
                     if let Some(ref tx) = save_mic_raw_tx {
-                        let _ = tx.send_async(mic_chunk_raw.clone()).await;
+                        let _ = tx.send_async(mic_chunk.clone()).await;
                     }
                     if let Some(ref tx) = save_speaker_raw_tx {
                         let _ = tx.send_async(speaker_chunk.clone()).await;
@@ -454,7 +474,7 @@ impl Session {
             let stop_tx = stop_tx.clone();
 
             async move {
-                let (listen_stream, listen_handle) = listen_client
+                let (listen_stream, _listen_handle) = listen_client
                     .from_realtime_audio(combined_audio_stream)
                     .await
                     .unwrap();
@@ -462,66 +482,69 @@ impl Session {
                 futures_util::pin_mut!(listen_stream);
 
                 let mut manager = TranscriptManager::default();
-                let mut last_final_time: Option<tokio::time::Instant> = None;
 
                 loop {
                     match tokio::time::timeout(LISTEN_STREAM_TIMEOUT, listen_stream.next()).await {
                         Ok(Some(response)) => {
-                            if let owhisper_interface::StreamResponse::TranscriptResponse {
-                                is_final,
-                                ..
-                            } = &response
-                            {
-                                match (is_final, last_final_time) {
-                                    (false, Some(prev)) => {
-                                        if prev.elapsed() > std::time::Duration::from_secs(10)
-                                        {
-                                            listen_handle
-                                                .finalize_with_text(
-                                                    serde_json::to_string(
-                                                        &owhisper_interface::ControlMessage::Finalize,
-                                                    )
-                                                    .unwrap()
-                                                    .into(),
-                                                )
-                                                .await;
-
-                                            last_final_time = None
-                                        }
-                                    }
-                                    _ => {
-                                        last_final_time = Some(tokio::time::Instant::now());
-                                    }
-                                }
-                            }
-
                             let diff = manager.append(response.clone());
 
-                            let partial_words = diff
+                            let partial_words_by_channel: HashMap<
+                                usize,
+                                Vec<owhisper_interface::Word2>,
+                            > = diff
                                 .partial_words
                                 .iter()
-                                .map(|w| owhisper_interface::Word2::from(w.clone()))
-                                .collect::<Vec<_>>();
-
+                                .map(|(channel_idx, words)| {
+                                    (
+                                        *channel_idx,
+                                        words
+                                            .iter()
+                                            .map(|w| owhisper_interface::Word2::from(w.clone()))
+                                            .collect::<Vec<_>>(),
+                                    )
+                                })
+                                .collect();
                             SessionEvent::PartialWords {
-                                words: partial_words,
+                                words: partial_words_by_channel,
                             }
                             .emit(&app)
                             .unwrap();
 
-                            let final_words = diff
+                            let final_words_by_channel: HashMap<
+                                usize,
+                                Vec<owhisper_interface::Word2>,
+                            > = diff
                                 .final_words
                                 .iter()
-                                .map(|w| owhisper_interface::Word2::from(w.clone()))
-                                .collect::<Vec<_>>();
+                                .map(|(channel_idx, words)| {
+                                    (
+                                        *channel_idx,
+                                        words
+                                            .iter()
+                                            .map(|w| owhisper_interface::Word2::from(w.clone()))
+                                            .collect::<Vec<_>>(),
+                                    )
+                                })
+                                .collect();
 
-                            update_session(&app, &session.id, final_words.clone())
-                                .await
-                                .unwrap();
+                            update_session(
+                                &app,
+                                &session.id,
+                                final_words_by_channel
+                                    .clone()
+                                    .values()
+                                    .flatten()
+                                    .cloned()
+                                    .collect(),
+                            )
+                            .await
+                            .unwrap();
 
-                            SessionEvent::FinalWords { words: final_words }
-                                .emit(&app)
-                                .unwrap();
+                            SessionEvent::FinalWords {
+                                words: final_words_by_channel,
+                            }
+                            .emit(&app)
+                            .unwrap();
                         }
                         Ok(None) => {
                             tracing::info!("listen_stream_ended");
@@ -614,7 +637,7 @@ async fn setup_listen_client<R: tauri::Runtime>(
         .api_key(conn.api_key.unwrap_or_default())
         .params(owhisper_interface::ListenParams {
             languages,
-            redemption_time_ms: Some(if is_onboarding { 70 } else { 500 }),
+            redemption_time_ms: Some(if is_onboarding { 60 } else { 400 }),
             ..Default::default()
         })
         .build_dual())

@@ -59,10 +59,12 @@ export function ChatView() {
 
   const {
     isGenerating,
+    isStreamingText,
     handleSubmit,
     handleQuickAction,
     handleApplyMarkdown,
     handleKeyDown,
+    handleStop,
   } = useChatLogic({
     sessionId,
     userId,
@@ -170,6 +172,8 @@ export function ChatView() {
             sessionTitle={sessionData.data?.title || "Untitled"}
             hasEnhancedNote={!!(sessionData.data?.enhancedContent)}
             onApplyMarkdown={handleApplyMarkdown}
+            isGenerating={isGenerating}
+            isStreamingText={isStreamingText}
           />
         )}
 
@@ -183,6 +187,7 @@ export function ChatView() {
         entityType={activeEntity?.type}
         onNoteBadgeClick={handleNoteBadgeClick}
         isGenerating={isGenerating}
+        onStop={handleStop}
       />
     </div>
   );

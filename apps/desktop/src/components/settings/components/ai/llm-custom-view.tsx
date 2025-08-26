@@ -48,6 +48,7 @@ const openrouterModels = [
 
 export function LLMCustomView({
   customLLMEnabled,
+  selectedLLMModel,
   setSelectedLLMModel,
   setCustomLLMEnabledMutation,
   configureCustomEndpoint,
@@ -58,12 +59,27 @@ export function LLMCustomView({
   openrouterForm,
   customForm,
   isLocalEndpoint,
+  hyprCloudEnabled,
+  setHyprCloudEnabledMutation,
 }: SharedCustomEndpointProps) {
+  // Track user intent for accordion opening
+  const [userOpenedAccordion, setUserOpenedAccordion] = useState<string | null>(null);
+
+  // Clear accordion when HyprCloud is enabled
+  useEffect(() => {
+    if (hyprCloudEnabled?.data) {
+      setOpenAccordion(null);
+    }
+  }, [hyprCloudEnabled?.data, setOpenAccordion]);
   // Watch forms and submit when complete and valid
   useEffect(() => {
     const subscription = openaiForm.watch((values) => {
-      // Manual validation: OpenAI key starts with "sk-" and model is selected
-      if (values.api_key && values.api_key.startsWith("sk-") && values.model) {
+      // Only auto-configure if user opened this accordion OR custom is already enabled
+      if (
+        (userOpenedAccordion === "openai" || customLLMEnabled.data)
+        && values.api_key && values.api_key.startsWith("sk-") && values.model
+      ) {
+        setHyprCloudEnabledMutation.mutate(false);
         configureCustomEndpoint({
           provider: "openai",
           api_base: "", // Will be auto-set
@@ -73,12 +89,16 @@ export function LLMCustomView({
       }
     });
     return () => subscription.unsubscribe();
-  }, [openaiForm, configureCustomEndpoint]);
+  }, [openaiForm, configureCustomEndpoint, userOpenedAccordion, customLLMEnabled.data]);
 
   useEffect(() => {
     const subscription = geminiForm.watch((values) => {
-      // Manual validation: Gemini key starts with "AIza" and model is selected
-      if (values.api_key && values.api_key.startsWith("AIza") && values.model) {
+      // Only auto-configure if user opened this accordion OR custom is already enabled
+      if (
+        (userOpenedAccordion === "gemini" || customLLMEnabled.data)
+        && values.api_key && values.api_key.startsWith("AIza") && values.model
+      ) {
+        setHyprCloudEnabledMutation.mutate(false);
         configureCustomEndpoint({
           provider: "gemini",
           api_base: "", // Will be auto-set
@@ -88,12 +108,16 @@ export function LLMCustomView({
       }
     });
     return () => subscription.unsubscribe();
-  }, [geminiForm, configureCustomEndpoint]);
+  }, [geminiForm, configureCustomEndpoint, userOpenedAccordion, customLLMEnabled.data]);
 
   useEffect(() => {
     const subscription = openrouterForm.watch((values) => {
-      // Manual validation: OpenRouter key starts with "sk-" and model is selected
-      if (values.api_key && values.api_key.startsWith("sk-") && values.model) {
+      // Only auto-configure if user opened this accordion OR custom is already enabled
+      if (
+        (userOpenedAccordion === "openrouter" || customLLMEnabled.data)
+        && values.api_key && values.api_key.startsWith("sk-") && values.model
+      ) {
+        setHyprCloudEnabledMutation.mutate(false);
         configureCustomEndpoint({
           provider: "openrouter",
           api_base: "", // Will be auto-set
@@ -103,13 +127,19 @@ export function LLMCustomView({
       }
     });
     return () => subscription.unsubscribe();
-  }, [openrouterForm, configureCustomEndpoint]);
+  }, [openrouterForm, configureCustomEndpoint, userOpenedAccordion, customLLMEnabled.data]);
 
   useEffect(() => {
     const subscription = customForm.watch((values) => {
-      // Manual validation: URL and model are present
-      if (values.api_base && values.model) {
+      // Only auto-configure if user opened this accordion OR custom is already enabled
+      // Also exclude HyprCloud URL from being stored as 'others'
+      if (
+        (userOpenedAccordion === "others" || customLLMEnabled.data)
+        && values.api_base && values.api_base !== "https://pro.hyprnote.com" && values.model
+      ) {
         try {
+          setHyprCloudEnabledMutation.mutate(false);
+          console.log("we are now setting the 'others' endpoint");
           // Basic URL validation
           new URL(values.api_base);
           configureCustomEndpoint({
@@ -124,28 +154,36 @@ export function LLMCustomView({
       }
     });
     return () => subscription.unsubscribe();
-  }, [customForm, configureCustomEndpoint]);
+  }, [customForm, configureCustomEndpoint, userOpenedAccordion, customLLMEnabled.data]);
 
   const handleAccordionClick = (provider: "openai" | "gemini" | "openrouter" | "others") => {
-    if (!customLLMEnabled.data) {
-      setCustomLLMEnabledMutation.mutate(true);
+    // Track that user explicitly opened this accordion
+    setUserOpenedAccordion(provider);
+
+    // If HyprCloud is active, clicking an accordion should disable it
+    if (hyprCloudEnabled?.data) {
+      // setHyprCloudEnabledMutation.mutate(false);
       setOpenAccordion(provider);
+      if (selectedLLMModel === "hyprcloud") {
+        setSelectedLLMModel("");
+      }
       return;
     }
 
-    // Don't allow deselecting - only allow switching between providers
-    // If clicking on the same provider, keep it selected
-    if (openAccordion === provider) {
-      return; // Do nothing, keep current selection
+    // Always allow accordion opening/switching, don't auto-enable custom
+    setOpenAccordion(provider === openAccordion ? null : provider);
+
+    if (selectedLLMModel === "hyprcloud") {
+      setSelectedLLMModel("");
     }
-
-    // Switch to the new provider
-    setOpenAccordion(provider);
-
-    // Enable custom LLM and clear local model selection
-    setCustomLLMEnabledMutation.mutate(true);
-    setSelectedLLMModel("");
   };
+
+  // Reset user intent when switching away from custom tab or when HyprCloud is enabled
+  useEffect(() => {
+    if (hyprCloudEnabled?.data || !openAccordion) {
+      setUserOpenedAccordion(null);
+    }
+  }, [hyprCloudEnabled?.data, openAccordion]);
 
   // temporary fix for fetching models smoothly
   const [debouncedApiBase, setDebouncedApiBase] = useState("");
@@ -232,10 +270,9 @@ export function LLMCustomView({
         <div
           className={cn(
             "border rounded-lg transition-all duration-150 ease-in-out cursor-pointer",
-            openAccordion === "openai" && customLLMEnabled.data
+            openAccordion === "openai"
               ? "border-blue-500 ring-2 ring-blue-500 bg-blue-50"
               : "border-neutral-200 bg-white hover:border-neutral-300",
-            !customLLMEnabled.data && "opacity-60",
           )}
         >
           <div
@@ -258,12 +295,12 @@ export function LLMCustomView({
                 </p>
               </div>
               <div className="text-neutral-400">
-                {openAccordion === "openai" && customLLMEnabled.data ? "−" : "+"}
+                {openAccordion === "openai" ? "−" : "+"}
               </div>
             </div>
           </div>
 
-          {openAccordion === "openai" && customLLMEnabled.data && (
+          {openAccordion === "openai" && (
             <div className="px-4 pb-4 border-t">
               <div className="mt-4">
                 <Form {...openaiForm}>
@@ -328,10 +365,9 @@ export function LLMCustomView({
         <div
           className={cn(
             "border rounded-lg transition-all duration-150 ease-in-out cursor-pointer",
-            openAccordion === "gemini" && customLLMEnabled.data
+            openAccordion === "gemini"
               ? "border-blue-500 ring-2 ring-blue-500 bg-blue-50"
               : "border-neutral-200 bg-white hover:border-neutral-300",
-            !customLLMEnabled.data && "opacity-60",
           )}
         >
           <div
@@ -354,12 +390,12 @@ export function LLMCustomView({
                 </p>
               </div>
               <div className="text-neutral-400">
-                {openAccordion === "gemini" && customLLMEnabled.data ? "−" : "+"}
+                {openAccordion === "gemini" ? "−" : "+"}
               </div>
             </div>
           </div>
 
-          {openAccordion === "gemini" && customLLMEnabled.data && (
+          {openAccordion === "gemini" && (
             <div className="px-4 pb-4 border-t">
               <div className="mt-4">
                 <Form {...geminiForm}>
@@ -424,10 +460,9 @@ export function LLMCustomView({
         <div
           className={cn(
             "border rounded-lg transition-all duration-150 ease-in-out cursor-pointer",
-            openAccordion === "openrouter" && customLLMEnabled.data
+            openAccordion === "openrouter"
               ? "border-blue-500 ring-2 ring-blue-500 bg-blue-50"
               : "border-neutral-200 bg-white hover:border-neutral-300",
-            !customLLMEnabled.data && "opacity-60",
           )}
         >
           <div
@@ -460,12 +495,12 @@ export function LLMCustomView({
                 </p>
               </div>
               <div className="text-neutral-400">
-                {openAccordion === "openrouter" && customLLMEnabled.data ? "−" : "+"}
+                {openAccordion === "openrouter" ? "−" : "+"}
               </div>
             </div>
           </div>
 
-          {openAccordion === "openrouter" && customLLMEnabled.data && (
+          {openAccordion === "openrouter" && (
             <div className="px-4 pb-4 border-t">
               <div className="mt-4">
                 <Form {...openrouterForm}>
@@ -530,10 +565,9 @@ export function LLMCustomView({
         <div
           className={cn(
             "border rounded-lg transition-all duration-150 ease-in-out cursor-pointer",
-            openAccordion === "others" && customLLMEnabled.data
+            openAccordion === "others"
               ? "border-blue-500 ring-2 ring-blue-500 bg-blue-50"
               : "border-neutral-200 bg-white hover:border-neutral-300",
-            !customLLMEnabled.data && "opacity-60",
           )}
         >
           <div
@@ -550,12 +584,12 @@ export function LLMCustomView({
                 </p>
               </div>
               <div className="text-neutral-400">
-                {openAccordion === "others" && customLLMEnabled.data ? "−" : "+"}
+                {openAccordion === "others" ? "−" : "+"}
               </div>
             </div>
           </div>
 
-          {openAccordion === "others" && customLLMEnabled.data && (
+          {openAccordion === "others" && (
             <div className="px-4 pb-4 border-t">
               <div className="mt-4">
                 <Form {...customForm}>

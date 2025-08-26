@@ -10,6 +10,8 @@ export interface Message {
   parts?: MessagePart[];
   isUser: boolean;
   timestamp: Date;
+  type: "text-delta" | "tool-start" | "tool-result" | "tool-error" | "generating";
+  toolDetails?: any;
 }
 
 export type ChatSession = {

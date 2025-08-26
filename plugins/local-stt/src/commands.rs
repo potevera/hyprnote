@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use tauri::ipc::Channel;
 
 use crate::{
-    server::ServerType, LocalSttPluginExt, SttModelInfo, SupportedSttModel, SUPPORTED_MODELS,
+    server::{ServerHealth, ServerType},
+    LocalSttPluginExt, SttModelInfo, SupportedSttModel, SUPPORTED_MODELS,
 };
 
 #[tauri::command]
@@ -100,6 +101,12 @@ pub async fn stop_server<R: tauri::Runtime>(
 #[specta::specta]
 pub async fn get_servers<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
-) -> Result<HashMap<ServerType, Option<String>>, String> {
+) -> Result<HashMap<ServerType, ServerHealth>, String> {
     app.get_servers().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn list_supported_languages(model: SupportedSttModel) -> Vec<hypr_language::Language> {
+    model.supported_languages()
 }

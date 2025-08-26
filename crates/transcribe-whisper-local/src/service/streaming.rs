@@ -17,7 +17,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use tower::Service;
 
-use hypr_chunker::VadExt;
+use hypr_vad::VadExt;
 use hypr_ws_utils::{ConnectionGuard, ConnectionManager};
 use owhisper_interface::{Alternatives, Channel, ListenParams, Metadata, StreamResponse, Word};
 
@@ -134,7 +134,7 @@ async fn handle_websocket_connection(
     let redemption_time = params
         .redemption_time_ms
         .map(|ms| Duration::from_millis(ms))
-        .unwrap_or(Duration::from_millis(500));
+        .unwrap_or(Duration::from_millis(400));
 
     match params.channels {
         1 => {
@@ -154,12 +154,12 @@ async fn handle_single_channel(
     redemption_time: Duration,
 ) {
     let audio_source = hypr_ws_utils::WebSocketAudioSource::new(ws_receiver, 16 * 1000);
-    let vad_chunks = audio_source.vad_chunks(redemption_time);
+    let vad_chunks = audio_source.speech_chunks(redemption_time);
 
     let chunked = hypr_whisper_local::AudioChunkStream(process_vad_stream(vad_chunks, "mixed"));
 
     let stream = hypr_whisper_local::TranscribeMetadataAudioStreamExt::transcribe(chunked, model);
-    process_transcription_stream(ws_sender, stream, guard).await;
+    process_transcription_stream(ws_sender, stream, guard, 1).await;
 }
 
 async fn handle_dual_channel(
@@ -173,12 +173,12 @@ async fn handle_dual_channel(
         hypr_ws_utils::split_dual_audio_sources(ws_receiver, 16 * 1000);
 
     let mic_chunked = {
-        let mic_vad_chunks = mic_source.vad_chunks(redemption_time);
+        let mic_vad_chunks = mic_source.speech_chunks(redemption_time);
         hypr_whisper_local::AudioChunkStream(process_vad_stream(mic_vad_chunks, "mic"))
     };
 
     let speaker_chunked = {
-        let speaker_vad_chunks = speaker_source.vad_chunks(redemption_time);
+        let speaker_vad_chunks = speaker_source.speech_chunks(redemption_time);
         hypr_whisper_local::AudioChunkStream(process_vad_stream(speaker_vad_chunks, "speaker"))
     };
 
@@ -190,13 +190,14 @@ async fn handle_dual_channel(
     let stream =
         hypr_whisper_local::TranscribeMetadataAudioStreamExt::transcribe(merged_stream, model);
 
-    process_transcription_stream(ws_sender, stream, guard).await;
+    process_transcription_stream(ws_sender, stream, guard, 2).await;
 }
 
 async fn process_transcription_stream(
     mut ws_sender: futures_util::stream::SplitSink<WebSocket, Message>,
     mut stream: impl futures_util::Stream<Item = hypr_whisper_local::Segment> + Unpin,
     guard: ConnectionGuard,
+    channels: i32,
 ) {
     loop {
         tokio::select! {
@@ -221,16 +222,16 @@ async fn process_transcription_stream(
                 );
 
                 let (speaker, channel_index) = match source.as_deref() {
-                    Some("mic") => (Some(0), vec![0]),
-                    Some("speaker") => (Some(1), vec![1]),
-                    _ => (None, vec![0]),
+                    Some("mic") => (Some(0), vec![0, channels]),
+                    Some("speaker") => (Some(1), vec![1, channels]),
+                    _ => (None, vec![0, 1]),
                 };
 
                 let words: Vec<Word> = text
                     .split_whitespace()
                     .filter(|w| !w.is_empty())
                     .map(|w| Word {
-                        word: w.to_string(),
+                        word: w.trim().to_string(),
                         start: start_f64,
                         end: start_f64 + duration_f64,
                         confidence,
@@ -276,7 +277,7 @@ fn process_vad_stream<S, E>(
     source_name: &str,
 ) -> impl futures_util::Stream<Item = hypr_whisper_local::SimpleAudioChunk>
 where
-    S: futures_util::Stream<Item = Result<hypr_chunker::AudioChunk, E>>,
+    S: futures_util::Stream<Item = Result<hypr_vad::AudioChunk, E>>,
     E: std::fmt::Display,
 {
     let source_name = source_name.to_string();
